@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"context"
+	"errors"
 	"io"
 	"io/ioutil"
 	golog "log"
@@ -44,12 +45,41 @@ type mdnsService struct {
 	interval time.Duration
 }
 
+func getDialableListenAddrs(ph host.Host) ([]*net.TCPAddr, error) {
+	var out []*net.TCPAddr
+	for _, addr := range ph.Addrs() {
+		na, err := manet.ToNetAddr(addr)
+		if err != nil {
+			continue
+		}
+		tcp, ok := na.(*net.TCPAddr)
+		if ok {
+			out = append(out, tcp)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("failed to find good external addr from peerhost")
+	}
+	return out, nil
+}
+
 func NewMdnsService(ctx context.Context, peerhost host.Host, interval time.Duration, serviceTag string) (Service, error) {
 
 	// TODO: dont let mdns use logging...
 	golog.SetOutput(ioutil.Discard)
 
-	port := 42424
+	var ipaddrs []net.IP
+	port := 4001
+
+	addrs, err := getDialableListenAddrs(peerhost)
+	if err != nil {
+		log.Warning(err)
+	} else {
+		port = addrs[0].Port
+		for _, a := range addrs {
+			ipaddrs = append(ipaddrs, a.IP)
+		}
+	}
 	myid := peerhost.ID().Pretty()
 
 	info := []string{myid}
@@ -63,7 +93,7 @@ func NewMdnsService(ctx context.Context, peerhost host.Host, interval time.Durat
 	}
 
 	// Create the mDNS server, defer shutdown
-	server, err := mdns.Register(myid, serviceTag, "", port, info, nil)
+	server, err := mdns.Register(myid, serviceTag, "local.", port, info, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -103,10 +133,10 @@ func (m *mdnsService) pollForEntries(ctx context.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 		defer cancel()
 
-		if err := m.service.Browse(ctx, m.tag, "local", entriesCh); err != nil {
+		if err := m.service.Browse(ctx, m.tag, "local.", entriesCh); err != nil {
 			log.Error("mdns lookup error: ", err)
+			close(entriesCh)
 		}
-		close(entriesCh)
 
 		log.Debug("mdns query complete")
 
