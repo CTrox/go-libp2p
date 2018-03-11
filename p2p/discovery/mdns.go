@@ -130,7 +130,7 @@ func (m *mdnsService) pollForEntries(ctx context.Context) {
 
 		log.Debug("starting mdns query")
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		ctx, cancel := context.WithTimeout(context.Background(), m.interval)
 		defer cancel()
 
 		if err := m.service.Browse(ctx, m.tag, "local.", entriesCh); err != nil {
