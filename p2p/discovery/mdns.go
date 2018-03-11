@@ -7,16 +7,17 @@ import (
 	"io/ioutil"
 	golog "log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
+	mdns "github.com/grandcat/zeroconf"
 	logging "github.com/ipfs/go-log"
 	"github.com/libp2p/go-libp2p-host"
 	"github.com/libp2p/go-libp2p-peer"
 	pstore "github.com/libp2p/go-libp2p-peerstore"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr-net"
-	"github.com/whyrusleeping/mdns"
 )
 
 var log = logging.Logger("mdns")
@@ -35,7 +36,7 @@ type Notifee interface {
 
 type mdnsService struct {
 	server  *mdns.Server
-	service *mdns.MDNSService
+	service *mdns.Resolver
 	host    host.Host
 	tag     string
 
@@ -79,27 +80,27 @@ func NewMdnsService(ctx context.Context, peerhost host.Host, interval time.Durat
 			ipaddrs = append(ipaddrs, a.IP)
 		}
 	}
-
 	myid := peerhost.ID().Pretty()
 
 	info := []string{myid}
 	if serviceTag == "" {
 		serviceTag = ServiceTag
 	}
-	service, err := mdns.NewMDNSService(myid, serviceTag, "", "", port, ipaddrs, info)
+
+	resolver, err := mdns.NewResolver(nil)
 	if err != nil {
-		return nil, err
+		log.Error("Failed to initialize resolver:", err)
 	}
 
 	// Create the mDNS server, defer shutdown
-	server, err := mdns.NewServer(&mdns.Config{Zone: service})
+	server, err := mdns.Register(myid, serviceTag, "local.", port, info, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	s := &mdnsService{
 		server:   server,
-		service:  service,
+		service:  resolver,
 		host:     peerhost,
 		interval: interval,
 		tag:      serviceTag,
@@ -111,34 +112,32 @@ func NewMdnsService(ctx context.Context, peerhost host.Host, interval time.Durat
 }
 
 func (m *mdnsService) Close() error {
-	return m.server.Shutdown()
+	m.server.Shutdown()
+	// grandcat/zerconf swallows error, satisfy interface
+	return nil
 }
 
 func (m *mdnsService) pollForEntries(ctx context.Context) {
-
 	ticker := time.NewTicker(m.interval)
 	for {
 		//execute mdns query right away at method call and then with every tick
 		entriesCh := make(chan *mdns.ServiceEntry, 16)
-		go func() {
-			for entry := range entriesCh {
+		go func(results <-chan *mdns.ServiceEntry) {
+			for entry := range results {
 				m.handleEntry(entry)
 			}
-		}()
+		}(entriesCh)
 
 		log.Debug("starting mdns query")
-		qp := &mdns.QueryParam{
-			Domain:  "local",
-			Entries: entriesCh,
-			Service: m.tag,
-			Timeout: time.Second * 5,
+
+		ctx, cancel := context.WithTimeout(context.Background(), m.interval)
+		defer cancel()
+
+		if err := m.service.Browse(ctx, m.tag, "local.", entriesCh); err != nil {
+			log.Error("mdns lookup error: ", err)
+			close(entriesCh)
 		}
 
-		err := mdns.Query(qp)
-		if err != nil {
-			log.Error("mdns lookup error: ", err)
-		}
-		close(entriesCh)
 		log.Debug("mdns query complete")
 
 		select {
@@ -152,8 +151,10 @@ func (m *mdnsService) pollForEntries(ctx context.Context) {
 }
 
 func (m *mdnsService) handleEntry(e *mdns.ServiceEntry) {
-	log.Debugf("Handling MDNS entry: %s:%d %s", e.AddrV4, e.Port, e.Info)
-	mpeer, err := peer.IDB58Decode(e.Info)
+	// pull out the txt
+	info := strings.Join(e.Text, "|")
+
+	mpeer, err := peer.IDB58Decode(info)
 	if err != nil {
 		log.Warning("Error parsing peer ID from mdns entry: ", err)
 		return
@@ -164,25 +165,29 @@ func (m *mdnsService) handleEntry(e *mdns.ServiceEntry) {
 		return
 	}
 
-	maddr, err := manet.FromNetAddr(&net.TCPAddr{
-		IP:   e.AddrV4,
-		Port: e.Port,
-	})
-	if err != nil {
-		log.Warning("Error parsing multiaddr from mdns entry: ", err)
-		return
-	}
+	for _, ipv4 := range e.AddrIPv4 {
+		log.Debugf("Handling MDNS entry: %s:%d %s", ipv4, e.Port, info)
 
-	pi := pstore.PeerInfo{
-		ID:    mpeer,
-		Addrs: []ma.Multiaddr{maddr},
-	}
+		maddr, err := manet.FromNetAddr(&net.TCPAddr{
+			IP:   ipv4,
+			Port: e.Port,
+		})
+		if err != nil {
+			log.Warning("Error parsing multiaddr from mdns entry: ", err)
+			return
+		}
 
-	m.lk.Lock()
-	for _, n := range m.notifees {
-		go n.HandlePeerFound(pi)
+		pi := pstore.PeerInfo{
+			ID:    mpeer,
+			Addrs: []ma.Multiaddr{maddr},
+		}
+
+		m.lk.Lock()
+		for _, n := range m.notifees {
+			go n.HandlePeerFound(pi)
+		}
+		m.lk.Unlock()
 	}
-	m.lk.Unlock()
 }
 
 func (m *mdnsService) RegisterNotifee(n Notifee) {
